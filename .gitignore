@@ -40,3 +40,14 @@ sessionmanager-bundle
 backend.hcl
 resources.txt
 errored.tfstate
+
+# --- Agent worklog (scratch handoff state, not project source) ---
+.agent/
+
+# --- CDK artifacts ---
+cdk/.venv/
+cdk/cdk.out/
+cdk/cdk.context.json
+cdk/assets/config.yaml
+**/__pycache__/
+.venv/

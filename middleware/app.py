@@ -78,6 +78,18 @@ def setup_database():
             print(f"DATABASE_MIDDLEWARE_URL environment variable not set")
             raise ValueError("DATABASE_MIDDLEWARE_URL environment variable not set")
 
+        # Force the psycopg2 driver. The connection string is a plain
+        # "postgresql://" URL (shared with LiteLLM/Prisma, which requires that
+        # bare scheme). On this SQLAlchemy build a bare "postgresql://" resolves
+        # to the psycopg (v3) dialect, but the image only ships psycopg2-binary
+        # -> ModuleNotFoundError: No module named 'psycopg'. Pinning the scheme
+        # to "postgresql+psycopg2://" routes to the installed driver without
+        # affecting LiteLLM (which reads the secret as plain postgresql://).
+        if database_url.startswith("postgresql://"):
+            database_url = "postgresql+psycopg2://" + database_url[len("postgresql://"):]
+        elif database_url.startswith("postgres://"):
+            database_url = "postgresql+psycopg2://" + database_url[len("postgres://"):]
+
         # Parse the URL to get base connection to postgres database
         url_parts = database_url.rsplit("/", 1)
         base_url = f"{url_parts[0]}/postgres"
@@ -1118,6 +1130,26 @@ async def list_session_ids_for_api_key(request: Request):
     return {"session_ids": session_ids}
 
 
+# Headers that must NOT be copied verbatim when proxying, because the body is
+# re-serialized by FastAPI's Response (or re-sent to the upstream). Forwarding a
+# stale Content-Length / Content-Encoding / Transfer-Encoding makes the declared
+# length/encoding disagree with the actual bytes, which clients see as a
+# truncated body or "Connection reset by peer". Host must not be forwarded
+# upstream either.
+_HOP_BY_HOP = {
+    "content-length",
+    "content-encoding",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "host",
+}
+
+
+def _clean_headers(headers) -> dict:
+    return {k: v for k, v in dict(headers).items() if k.lower() not in _HOP_BY_HOP}
+
+
 # ToDo: Enforce that a non-admin user can only create keys for themself if this bug isn't fixed in a timely manner https://github.com/BerriAI/litellm/issues/7336
 @app.post("/key/generate")
 async def forward_key_generate(request: Request):
@@ -1125,12 +1157,13 @@ async def forward_key_generate(request: Request):
         response = await client.post(
             f"{LITELLM_ENDPOINT}/key/generate",
             content=await request.body(),
-            headers=request.headers,
+            headers=_clean_headers(request.headers),
         )
         return Response(
             content=response.content,
             status_code=response.status_code,
-            headers=response.headers,
+            headers=_clean_headers(response.headers),
+            media_type=response.headers.get("content-type"),
         )
 
 
@@ -1143,7 +1176,7 @@ async def forward_user_new(request: Request):
         )
 
     token = auth_header[len("Bearer ") :]
-    final_headers = dict(request.headers)
+    final_headers = _clean_headers(request.headers)
     request_body = await request.body()
     body_json = json.loads(request_body)
 
@@ -1182,7 +1215,8 @@ async def forward_user_new(request: Request):
         body_json["user_role"] = "internal_user"
         print(f"body_json: {body_json}")
         request_body = json.dumps(body_json).encode()
-        final_headers["content-length"] = str(len(request_body))
+        # Do not set content-length manually; httpx derives it from `content`.
+        final_headers.pop("content-length", None)
         final_headers["authorization"] = f"Bearer {MASTER_KEY}"
 
     print(f"final_headers: {final_headers}")
@@ -1196,7 +1230,8 @@ async def forward_user_new(request: Request):
         return Response(
             content=response.content,
             status_code=response.status_code,
-            headers=response.headers,
+            headers=_clean_headers(response.headers),
+            media_type=response.headers.get("content-type"),
         )
 
 
